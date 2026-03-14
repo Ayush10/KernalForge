@@ -1,4 +1,4 @@
-# Reduce pipeline stages on three largest shapes to lower register pressure and improve occupancy
+# Retune two smallest benchmark shapes with smaller blocks for better SM occupancy
 from task import input_t, output_t
 
 import torch
@@ -14,9 +14,9 @@ SHAPE_CONFIGS: dict[tuple[int, int, int, int], helion.Config] = {
     (4, 64, 128, 4): helion.Config(block_sizes=[64, 128], num_warps=4, num_stages=2),
     (1, 768, 512, 4): helion.Config(block_sizes=[64, 64], num_warps=2, num_stages=3, l2_groupings=[1]),
     (1, 768, 2048, 4): helion.Config(block_sizes=[64, 128], num_warps=4, num_stages=4, l2_groupings=[2]),
-    (1, 1536, 2048, 4): helion.Config(block_sizes=[128, 128], num_warps=8, num_stages=2, l2_groupings=[8]),
-    (1, 2560, 2048, 4): helion.Config(block_sizes=[256, 64], num_warps=8, num_stages=2, l2_groupings=[8]),
-    (1, 2560, 4096, 4): helion.Config(block_sizes=[256, 128], num_warps=8, num_stages=3, l2_groupings=[8]),
+    (1, 1536, 2048, 4): helion.Config(block_sizes=[128, 128], num_warps=8, num_stages=4, l2_groupings=[8]),
+    (1, 2560, 2048, 4): helion.Config(block_sizes=[256, 64], num_warps=8, num_stages=4, l2_groupings=[8]),
+    (1, 2560, 4096, 4): helion.Config(block_sizes=[256, 128], num_warps=8, num_stages=5, l2_groupings=[8]),
 }
 
 
