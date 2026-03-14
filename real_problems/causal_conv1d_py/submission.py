@@ -1,3 +1,5 @@
+#!POPCORN leaderboard causal_conv1d
+#!POPCORN gpu B200_Nebius
 # Retune two smallest benchmark shapes with smaller blocks for better SM occupancy
 from task import input_t, output_t
 

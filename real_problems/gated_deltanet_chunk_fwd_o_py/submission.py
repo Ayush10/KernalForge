@@ -1,3 +1,5 @@
+#!POPCORN leaderboard gated_deltanet_chunk_fwd_o
+#!POPCORN gpu B200_Nebius
 from task import input_t, output_t
 
 import torch

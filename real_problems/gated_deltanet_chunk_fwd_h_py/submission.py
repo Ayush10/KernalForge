@@ -1,3 +1,5 @@
+#!POPCORN leaderboard gated_deltanet_chunk_fwd_h
+#!POPCORN gpu B200_Nebius
 # Separate dot from state decay to break dependency chain: dot computes independently, decay applied via FMA after
 from task import input_t, output_t
 

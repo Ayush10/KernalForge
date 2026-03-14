@@ -1,4 +1,6 @@
 # Double block sizes for three largest benchmark shapes to reduce block scheduling overhead
+#!POPCORN leaderboard fp8_quant
+#!POPCORN gpu B200_Nebius
 from task import input_t, output_t
 
 import torch

@@ -1,3 +1,5 @@
+#!POPCORN leaderboard gated_deltanet_recompute_w_u
+#!POPCORN gpu B200_Nebius
 # Precompute beta_g = beta * exp(g) on host to eliminate exp() inside kernel
 from task import input_t, output_t
 
