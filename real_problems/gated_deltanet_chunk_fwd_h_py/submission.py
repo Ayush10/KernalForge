@@ -1,6 +1,7 @@
 #!POPCORN leaderboard gated_deltanet_chunk_fwd_h
 #!POPCORN gpu B200_Nebius
-# Separate dot from state decay to break dependency chain: dot computes independently, decay applied via FMA after
+# Team: Kernal Forge
+# Fix: Group configs by (K,V) and create kernels lazily to cut submission-time JIT work
 from task import input_t, output_t
 
 import torch
@@ -8,22 +9,16 @@ import helion
 import helion.language as hl
 
 
-SHAPE_CONFIGS: dict[tuple[int, int, int, int, int], helion.Config] = {
-    (1, 64, 2, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),
-    (2, 128, 4, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),
-    (1, 256, 4, 64, 128): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),
-    (1, 64, 1, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),
-    (2, 512, 3, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, l2_groupings=[4]),
-    (2, 1024, 3, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=3, l2_groupings=[4]),
-    (3, 1024, 4, 100, 100): helion.Config(block_sizes=[16], num_warps=4, num_stages=1, l2_groupings=[4]),
-    (4, 1024, 4, 128, 128): helion.Config(block_sizes=[16], num_warps=4, num_stages=1, l2_groupings=[8]),
-    (2, 1536, 4, 128, 128): helion.Config(block_sizes=[16], num_warps=4, num_stages=1, l2_groupings=[8]),
-    (4, 2048, 8, 64, 64): helion.Config(block_sizes=[32], num_warps=8, num_stages=3, l2_groupings=[8]),
+KV_CONFIGS: dict[tuple[int, int], helion.Config] = {
+    (64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, l2_groupings=[4]),
+    (64, 128): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),
+    (100, 100): helion.Config(block_sizes=[16], num_warps=4, num_stages=1, l2_groupings=[4]),
+    (128, 128): helion.Config(block_sizes=[16], num_warps=4, num_stages=1, l2_groupings=[8]),
 }
 
 
 def _make_kernel(config: helion.Config):
-    @helion.kernel(static_shapes=True, dot_precision="ieee", config=config)
+    @helion.kernel(dot_precision="ieee", config=config)
     def kernel(
         k: torch.Tensor,
         w: torch.Tensor,
@@ -64,13 +59,11 @@ def _make_kernel(config: helion.Config):
 
                 v_out[b_idx, tc, h_idx, tv] = diff.to(v_out.dtype)
 
-                # Dot without acc=state: no dependency on state decay, can start immediately
                 update = hl.dot(
                     k[b_idx, tc, h_idx, :].to(torch.float32).T,
                     gated_diff,
                     out_dtype=torch.float32,
                 )
-                # Fused decay + accumulate: state * exp(g_last) + update
                 state = state * torch.exp(g_last) + update
 
         return h_out, v_out
@@ -78,12 +71,20 @@ def _make_kernel(config: helion.Config):
     return kernel
 
 
-_KERNELS = {shape: _make_kernel(cfg) for shape, cfg in SHAPE_CONFIGS.items()}
+_KERNEL_CACHE: dict[tuple[int, int], callable] = {}
+
+
+def _get_kernel(kv_shape: tuple[int, int]):
+    kernel = _KERNEL_CACHE.get(kv_shape)
+    if kernel is None:
+        kernel = _make_kernel(KV_CONFIGS[kv_shape])
+        _KERNEL_CACHE[kv_shape] = kernel
+    return kernel
 
 
 def custom_kernel(data: input_t) -> output_t:
     k, w, u, g = data
-    B, T, H, K = k.shape
+    K = k.shape[-1]
     V = u.shape[-1]
-    kernel = _KERNELS[(B, T, H, K, V)]
+    kernel = _get_kernel((K, V))
     return kernel(k, w, u, g)
