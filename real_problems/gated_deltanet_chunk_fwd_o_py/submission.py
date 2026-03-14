@@ -1,5 +1,6 @@
 #!POPCORN leaderboard gated_deltanet_chunk_fwd_o
 #!POPCORN gpu B200_Nebius
+# Team: Kernal Forge
 from task import input_t, output_t
 
 import torch
@@ -8,21 +9,23 @@ import helion.language as hl
 
 
 SHAPE_CONFIGS: dict[tuple[int, int, int, int, int], helion.Config] = {
-    (1, 64, 2, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),
-    (2, 128, 4, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),
-    (1, 256, 4, 64, 128): helion.Config(block_sizes=[8], num_warps=4, num_stages=1),
-    (1, 64, 1, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),
-    (2, 512, 3, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, l2_groupings=[4]),
-    (2, 1024, 3, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=3, l2_groupings=[4]),
-    (3, 1024, 4, 100, 100): helion.Config(block_sizes=[8], num_warps=4, num_stages=1, l2_groupings=[4]),
-    (4, 1024, 4, 128, 128): helion.Config(block_sizes=[8], num_warps=4, num_stages=1, l2_groupings=[8]),
-    (2, 1536, 4, 128, 128): helion.Config(block_sizes=[8], num_warps=4, num_stages=1, l2_groupings=[8]),
-    (4, 2048, 8, 64, 64): helion.Config(block_sizes=[32], num_warps=8, num_stages=3, l2_groupings=[8]),
+    # Test shapes
+    (1, 64, 2, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
+    (2, 128, 4, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
+    (1, 256, 4, 64, 128): helion.Config(block_sizes=[8], num_warps=4, num_stages=1, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
+    # Benchmark shapes
+    (1, 64, 1, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
+    (2, 512, 3, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
+    (2, 1024, 3, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
+    (3, 1024, 4, 100, 100): helion.Config(block_sizes=[32], num_warps=4, num_stages=1, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
+    (4, 1024, 4, 128, 128): helion.Config(block_sizes=[64], num_warps=4, num_stages=1, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
+    (2, 1536, 4, 128, 128): helion.Config(block_sizes=[64], num_warps=4, num_stages=1, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
+    (4, 2048, 8, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
 }
 
 
 def _make_kernel(config: helion.Config):
-    @helion.kernel(static_shapes=True, dot_precision="ieee", config=config)
+    @helion.kernel(static_shapes=True, config=config)
     def kernel(
         q: torch.Tensor,
         k: torch.Tensor,

@@ -1,7 +1,7 @@
 #!POPCORN leaderboard gated_deltanet_chunk_fwd_h
 #!POPCORN gpu B200_Nebius
 # Team: Kernal Forge
-# Fix: Group configs by (K,V) and create kernels lazily to cut submission-time JIT work
+# Optimizations: tf32 dot precision, per-(K,V) tuned configs, removed redundant casts
 from task import input_t, output_t
 
 import torch
@@ -10,15 +10,15 @@ import helion.language as hl
 
 
 KV_CONFIGS: dict[tuple[int, int], helion.Config] = {
-    (64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, l2_groupings=[4]),
-    (64, 128): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),
-    (100, 100): helion.Config(block_sizes=[16], num_warps=4, num_stages=1, l2_groupings=[4]),
-    (128, 128): helion.Config(block_sizes=[16], num_warps=4, num_stages=1, l2_groupings=[8]),
+    (64, 64): helion.Config(block_sizes=[16], num_warps=2, num_stages=3, l2_groupings=[8]),
+    (64, 128): helion.Config(block_sizes=[16], num_warps=2, num_stages=2),
+    (100, 100): helion.Config(block_sizes=[16], num_warps=2, num_stages=2, l2_groupings=[4]),
+    (128, 128): helion.Config(block_sizes=[8], num_warps=4, num_stages=1),
 }
 
 
 def _make_kernel(config: helion.Config):
-    @helion.kernel(dot_precision="ieee", config=config)
+    @helion.kernel(config=config)
     def kernel(
         k: torch.Tensor,
         w: torch.Tensor,
@@ -43,28 +43,28 @@ def _make_kernel(config: helion.Config):
 
             for tc in hl.tile(T, block_size=C):
                 chunk_idx = tc.begin // C
-                g_chunk = g[b_idx, tc, h_idx].to(torch.float32)
-                g_last = g[b_idx, tc.begin + C - 1, h_idx].to(torch.float32)
+                g_chunk = g[b_idx, tc, h_idx]
+                g_last_val = g[b_idx, tc.begin + C - 1, h_idx]
 
-                h_out[b_idx, chunk_idx, h_idx, :, tv] = state.to(h_out.dtype)
+                h_out[b_idx, chunk_idx, h_idx, :, tv] = state
 
                 proj = hl.dot(
-                    w[b_idx, tc, h_idx, :].to(torch.float32),
+                    w[b_idx, tc, h_idx, :],
                     state,
                     out_dtype=torch.float32,
                 )
-                diff = u[b_idx, tc, h_idx, tv].to(torch.float32) - proj
+                diff = u[b_idx, tc, h_idx, tv] - proj
 
-                gated_diff = diff * torch.exp(g_last - g_chunk)[:, None]
+                v_out[b_idx, tc, h_idx, tv] = diff
 
-                v_out[b_idx, tc, h_idx, tv] = diff.to(v_out.dtype)
+                gated_diff = diff * torch.exp(g_last_val - g_chunk)[:, None]
 
                 update = hl.dot(
-                    k[b_idx, tc, h_idx, :].to(torch.float32).T,
+                    k[b_idx, tc, h_idx, :].T,
                     gated_diff,
                     out_dtype=torch.float32,
                 )
-                state = state * torch.exp(g_last) + update
+                state = state * torch.exp(g_last_val) + update
 
         return h_out, v_out
 

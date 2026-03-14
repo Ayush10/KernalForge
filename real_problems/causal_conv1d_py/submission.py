@@ -1,115 +1,116 @@
 #!POPCORN leaderboard causal_conv1d
 #!POPCORN gpu B200_Nebius
-# Retune two smallest benchmark shapes with smaller blocks for better SM occupancy
 from task import input_t, output_t
 
 import torch
-import helion
-import helion.language as hl
+import triton
+import triton.language as tl
 
 
-SHAPE_CONFIGS: dict[tuple[int, int, int, int], helion.Config] = {
-    (1, 64, 64, 4): helion.Config(block_sizes=[64, 64], num_warps=4, num_stages=2),
-    (2, 128, 128, 4): helion.Config(block_sizes=[64, 128], num_warps=4, num_stages=3),
-    (1, 256, 256, 3): helion.Config(block_sizes=[128, 128], num_warps=4, num_stages=3),
-    (1, 128, 64, 8): helion.Config(block_sizes=[64, 64], num_warps=4, num_stages=3),
-    (4, 64, 128, 4): helion.Config(block_sizes=[64, 128], num_warps=4, num_stages=2),
-    (1, 768, 512, 4): helion.Config(block_sizes=[64, 64], num_warps=2, num_stages=3, l2_groupings=[1]),
-    (1, 768, 2048, 4): helion.Config(block_sizes=[64, 128], num_warps=4, num_stages=4, l2_groupings=[2]),
-    (1, 1536, 2048, 4): helion.Config(block_sizes=[128, 128], num_warps=8, num_stages=4, l2_groupings=[8]),
-    (1, 2560, 2048, 4): helion.Config(block_sizes=[256, 64], num_warps=8, num_stages=4, l2_groupings=[8]),
-    (1, 2560, 4096, 4): helion.Config(block_sizes=[256, 128], num_warps=8, num_stages=5, l2_groupings=[8]),
+@triton.jit
+def _causal_conv1d_k(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    D, S, stride_b,
+    W: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    GROUP_S: tl.constexpr,
+):
+    num_s_blocks = tl.cdiv(S, BLOCK_S)
+    num_d_blocks = tl.cdiv(D, BLOCK_D)
+    total_bd = tl.num_programs(1)
+
+    pid_s = tl.program_id(0)
+    pid_bd = tl.program_id(1)
+
+    # Swizzle for L2 locality: group S-blocks together
+    num_s_groups = tl.cdiv(num_s_blocks, GROUP_S)
+    group_id = pid_s // GROUP_S
+    first_s = group_id * GROUP_S
+    group_size = tl.minimum(num_s_blocks - first_s, GROUP_S)
+    pid_s_in_group = pid_s % GROUP_S
+    # Interleave: within each S-group, cycle through all bd blocks
+    # Actually use the swizzle2d approach
+    pid_s, pid_bd = tl.swizzle2d(pid_s, pid_bd, num_s_blocks, total_bd, GROUP_S)
+
+    pid_b = pid_bd // num_d_blocks
+    pid_d = pid_bd % num_d_blocks
+
+    d_off = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    s_off = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+
+    d_mask = d_off < D
+    s_mask = s_off < S
+
+    # Load bias [BLOCK_D]
+    bias = tl.load(b_ptr + d_off, mask=d_mask, other=0.0)
+
+    # Initialize accumulator with bias
+    acc = bias[:, None] + tl.zeros([BLOCK_D, BLOCK_S], dtype=tl.float32)
+
+    # Base pointer for this batch
+    x_base = x_ptr + pid_b * stride_b
+    y_base = y_ptr + pid_b * stride_b
+
+    # Fully unrolled convolution loop
+    for k in tl.static_range(W):
+        shift = W - 1 - k
+        wk = tl.load(w_ptr + d_off * W + k, mask=d_mask, other=0.0)
+        s_shifted = s_off - shift
+        xk = tl.load(
+            x_base + d_off[:, None] * S + s_shifted[None, :],
+            mask=d_mask[:, None] & (s_shifted >= 0)[None, :] & s_mask[None, :],
+            other=0.0,
+        )
+        acc += wk[:, None] * xk
+
+    # Store result
+    tl.store(
+        y_base + d_off[:, None] * S + s_off[None, :],
+        acc,
+        mask=d_mask[:, None] & s_mask[None, :],
+    )
+
+
+# Per-shape configs: (BLOCK_D, BLOCK_S, num_warps, num_stages, GROUP_S)
+# B200 has 148 SMs, 126MB L2
+_CONFIGS = {
+    # Test shapes
+    (1, 64, 64, 4):   (64, 64, 4, 2, 1),
+    (2, 128, 128, 4):  (64, 128, 4, 2, 1),
+    (1, 256, 256, 3):  (64, 256, 4, 2, 1),
+    (1, 128, 64, 8):   (64, 64, 4, 2, 1),
+    (4, 64, 128, 4):   (64, 128, 4, 2, 1),
+    # Benchmark shapes — tuned for B200
+    (1, 768, 512, 4):   (32, 64, 4, 2, 8),    # grid=(8,24)=192
+    (1, 768, 2048, 4):  (64, 128, 4, 3, 4),   # grid=(16,12)=192
+    (1, 1536, 2048, 4): (64, 128, 8, 3, 8),   # grid=(16,24)=384
+    (1, 2560, 2048, 4): (64, 128, 8, 3, 8),   # grid=(16,40)=640
+    (1, 2560, 4096, 4): (64, 128, 8, 4, 8),   # grid=(32,40)=1280
 }
-
-
-def _make_kernel(config: helion.Config):
-    @helion.kernel(static_shapes=True, config=config)
-    def kernel(
-        x: torch.Tensor,
-        w: torch.Tensor,
-        b: torch.Tensor,
-    ) -> torch.Tensor:
-        B, D, S = x.shape
-        W = hl.specialize(w.size(1))
-        y = torch.empty(B, D, S, dtype=x.dtype, device=x.device)
-
-        for rb, rd, rs in hl.tile([B, D, S], block_size=[1, None, None]):
-            bi = rb.begin
-            rs_idx = rs.index
-            in_bounds = rs_idx < S
-            bias_tile = hl.zeros([rd, rs], dtype=torch.float32)
-            bias_tile = bias_tile + b[rd][:, None]
-
-            if W == 4:
-                # Precompute all masks once to avoid redundant boolean ops per tap
-                ib_base = in_bounds[None, :]
-                ge1 = (rs_idx >= 1)
-                ge2 = (rs_idx >= 2)
-                ge3 = (rs_idx >= 3)
-                mask0 = ib_base
-                mask1 = (in_bounds & ge1)[None, :]
-                mask2 = (in_bounds & ge2)[None, :]
-                mask3 = (in_bounds & ge3)[None, :]
-
-                x0 = hl.load(x, [bi, rd, rs_idx - 3], extra_mask=mask3)
-                x1 = hl.load(x, [bi, rd, rs_idx - 2], extra_mask=mask2)
-                x2 = hl.load(x, [bi, rd, rs_idx - 1], extra_mask=mask1)
-                x3 = hl.load(x, [bi, rd, rs_idx], extra_mask=mask0)
-                acc = bias_tile
-                acc = acc + x0 * w[rd, 0][:, None]
-                acc = acc + x1 * w[rd, 1][:, None]
-                acc = acc + x2 * w[rd, 2][:, None]
-                acc = acc + x3 * w[rd, 3][:, None]
-            elif W == 3:
-                # Precompute masks for W=3
-                ib_base = in_bounds[None, :]
-                ge1 = (rs_idx >= 1)
-                ge2 = (rs_idx >= 2)
-                mask0 = ib_base
-                mask1 = (in_bounds & ge1)[None, :]
-                mask2 = (in_bounds & ge2)[None, :]
-
-                x0 = hl.load(x, [bi, rd, rs_idx - 2], extra_mask=mask2)
-                x1 = hl.load(x, [bi, rd, rs_idx - 1], extra_mask=mask1)
-                x2 = hl.load(x, [bi, rd, rs_idx], extra_mask=mask0)
-                acc = bias_tile
-                acc = acc + x0 * w[rd, 0][:, None]
-                acc = acc + x1 * w[rd, 1][:, None]
-                acc = acc + x2 * w[rd, 2][:, None]
-            elif W == 8:
-                acc = bias_tile
-                for tap in range(8):
-                    shift = 7 - tap
-                    x_tap = hl.load(
-                        x,
-                        [bi, rd, rs_idx - shift],
-                        extra_mask=(in_bounds & (rs_idx >= shift))[None, :],
-                    )
-                    acc = acc + x_tap * w[rd, tap][:, None]
-            else:
-                acc = bias_tile
-                for tap in range(W):
-                    shift = W - 1 - tap
-                    x_tap = hl.load(
-                        x,
-                        [bi, rd, rs_idx - shift],
-                        extra_mask=(in_bounds & (rs_idx >= shift))[None, :],
-                    )
-                    acc = acc + x_tap * w[rd, tap][:, None]
-
-            y[rb, rd, rs] = acc[None, :, :]
-
-        return y
-
-    return kernel
-
-
-_KERNELS = {shape: _make_kernel(cfg) for shape, cfg in SHAPE_CONFIGS.items()}
 
 
 def custom_kernel(data: input_t) -> output_t:
     x, weight, bias = data
     B, D, S = x.shape
     W = weight.shape[1]
-    kernel = _KERNELS[(B, D, S, W)]
-    return kernel(x, weight, bias)
+
+    y = torch.empty_like(x)
+
+    key = (B, D, S, W)
+    cfg = _CONFIGS.get(key, (64, 128, 4, 2, 4))
+    BLOCK_D, BLOCK_S, nw, ns, group_s = cfg
+
+    grid = (triton.cdiv(S, BLOCK_S), B * triton.cdiv(D, BLOCK_D))
+
+    _causal_conv1d_k[grid](
+        x, weight, bias, y,
+        D, S, D * S,
+        W=W,
+        BLOCK_D=BLOCK_D,
+        BLOCK_S=BLOCK_S,
+        GROUP_S=group_s,
+        num_warps=nw,
+        num_stages=ns,
+    )
+    return y
