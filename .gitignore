@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+gpu-improve-new/
+.claude/
+*.bak
+*.egg-info/
+dist/
+build/
+.helion_cache/
+experiments/
+_reference_kernels_tmp/
+*.zip
+*.rar
