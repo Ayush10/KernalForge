@@ -1,83 +1,99 @@
-# Double block sizes for three largest benchmark shapes to reduce block scheduling overhead
 #!POPCORN leaderboard fp8_quant
 #!POPCORN gpu B200_Nebius
+import torch
+import triton
+import triton.language as tl
 from task import input_t, output_t
 
-import torch
-import helion
-import helion.language as hl
+
+@triton.jit
+def _fp8_quant_nopad(
+    X, Q, S,
+    N,
+    GS: tl.constexpr,
+    BN: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BN + tl.arange(0, BN)
+    cols = tl.arange(0, GS)
+    offs = rows[:, None] * GS + cols[None, :]
+    x = tl.load(X + offs)
+    amax = tl.max(tl.abs(x), axis=1)
+    amax = tl.maximum(amax, 1e-10)
+    inv_amax = 448.0 / amax
+    q = x * inv_amax[:, None]
+    q = tl.minimum(tl.maximum(q, -448.0), 448.0)
+    tl.store(Q + offs, q)
+    tl.store(S + rows, amax * 2.232142857142857e-3)
 
 
-# Per-shape configs tuned for actual row counts: N = num_tokens * (hidden_dim // group_size)
-SHAPE_CONFIGS: dict[tuple, helion.Config] = {
+@triton.jit
+def _fp8_quant_masked(
+    X, Q, S,
+    N,
+    GS: tl.constexpr,
+    BN: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BN + tl.arange(0, BN)
+    cols = tl.arange(0, GS)
+    mask = rows < N
+    offs = rows[:, None] * GS + cols[None, :]
+    x = tl.load(X + offs, mask=mask[:, None], other=0.0)
+    amax = tl.max(tl.abs(x), axis=1)
+    amax = tl.maximum(amax, 1e-10)
+    inv_amax = 448.0 / amax
+    q = x * inv_amax[:, None]
+    q = tl.minimum(tl.maximum(q, -448.0), 448.0)
+    tl.store(Q + offs, q, mask=mask[:, None])
+    tl.store(S + rows, amax * 2.232142857142857e-3, mask=mask)
+
+
+# Tuned on B200 with CUDA graph timing
+_CFGS = {
     # Test shapes
-    (1, 256, 64): helion.Config(block_sizes=[4], num_warps=4, num_stages=2),    # N=4
-    (4, 512, 128): helion.Config(block_sizes=[4], num_warps=4, num_stages=2),   # N=16
-    (16, 1024, 64): helion.Config(block_sizes=[16], num_warps=4, num_stages=2), # N=256
-    (1, 4096, 128): helion.Config(block_sizes=[4], num_warps=4, num_stages=2),  # N=32
-    (8, 4096, 128): helion.Config(block_sizes=[16], num_warps=4, num_stages=2), # N=256
-    # Benchmark shapes – doubled block sizes to reduce grid/scheduling overhead
-    (16, 4096, 128): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),    # N=512
-    (256, 4096, 128): helion.Config(block_sizes=[64], num_warps=4, num_stages=2),   # N=8192
-    (256, 8192, 128): helion.Config(block_sizes=[64], num_warps=4, num_stages=2),   # N=16384
-    (4096, 7168, 128): helion.Config(block_sizes=[256], num_warps=4, num_stages=3), # N=229376
+    (1, 256, 64):      (4, 2, 1),
+    (4, 512, 128):     (8, 4, 1),
+    (16, 1024, 64):    (8, 1, 1),
+    (1, 4096, 128):    (8, 4, 1),
+    (8, 4096, 128):    (8, 4, 1),
+    # Benchmark shapes
+    (16, 4096, 128):   (8, 4, 1),
+    (256, 4096, 128):  (8, 1, 1),
+    (256, 8192, 128):  (4, 1, 1),
+    (4096, 7168, 128): (16, 8, 1),
 }
 
-
-def _make_kernel(config: helion.Config):
-    @helion.kernel(static_shapes=True, config=config)
-    def kernel(
-        data: torch.Tensor,        # [N, gsz] input rows (one group per row)
-        qout: torch.Tensor,        # [N, gsz] pre-allocated output quantized values
-        scales_out: torch.Tensor,  # [N] output scale per group
-    ) -> torch.Tensor:
-        nrows = data.size(0)
-        ncols = hl.specialize(data.size(1))
-        MAX_VAL = 448.0
-        EPS = 1e-10
-        INV_MAX = 1.0 / 448.0
-
-        for rr in hl.tile(nrows):
-            row = data[rr, :].to(torch.float32)
-
-            # Avoid abs temporary: compute max of positive and negative peaks
-            amax_pos = torch.amax(row, -1)
-            amax_neg = -torch.amin(row, -1)
-            amax = torch.maximum(amax_pos, amax_neg)
-            amax = torch.clamp(amax, min=EPS)
-
-            # Reciprocal multiply: scale via const multiply, quantize via broadcast multiply
-            scale = amax * INV_MAX
-            inv_scale = MAX_VAL / amax
-            q = torch.clamp(row * inv_scale[:, None], min=-MAX_VAL, max=MAX_VAL)
-            qout[rr, :] = q
-            scales_out[rr] = scale
-
-        return qout
-
-    return kernel
-
-
-_KERNELS = {shape: _make_kernel(cfg) for shape, cfg in SHAPE_CONFIGS.items()}
-
-# Host-side last-shape cache to skip dict lookup on repeated same-shape calls
-_cache_key = None
-_cache_kernel = None
+_prev_key = None
+_prev_cfg = None
 
 
 def custom_kernel(data: input_t) -> output_t:
-    global _cache_key, _cache_kernel
+    global _prev_key, _prev_cfg
     x, x_q, x_s = data
     T, H = x.shape
     G = x_s.shape[1]
-    gsz = H // G
+    gs = H // G
     N = T * G
 
-    key = (T, H, gsz)
-    if key != _cache_key:
-        _cache_key = key
-        _cache_kernel = _KERNELS[key]
+    key = (T, H, gs)
+    if key != _prev_key:
+        _prev_key = key
+        _prev_cfg = _CFGS.get(key, (8, 4, 1))
 
-    _cache_kernel(x.reshape(N, gsz), x_q.reshape(N, gsz), x_s.reshape(N))
+    bn, nw, ns = _prev_cfg
+    grid = ((N + bn - 1) // bn,)
 
+    if N % bn == 0:
+        _fp8_quant_nopad[grid](
+            x, x_q, x_s, N,
+            GS=gs, BN=bn,
+            num_warps=nw, num_stages=ns,
+        )
+    else:
+        _fp8_quant_masked[grid](
+            x, x_q, x_s, N,
+            GS=gs, BN=bn,
+            num_warps=nw, num_stages=ns,
+        )
     return x_q, x_s
