@@ -17,7 +17,12 @@ import helion.language as hl
 #   (128,128) — 2 shapes
 # Each group compiles ONE Triton kernel. 4 compilations × ~60s = ~240s < 420s timeout.
 KV_CONFIGS: dict[tuple[int, int], helion.Config] = {
-    (64, 64): helion.Config(num_warps=4, num_stages=3, l2_groupings=[4]),
+    (64, 64): helion.Config(
+        num_warps=4,
+        num_stages=3,
+        l2_groupings=[4],
+        advanced_controls_file="/opt/booster_pack/recompute_w_u_fwd_2.acf",
+    ),
     (64, 128): helion.Config(num_warps=8, num_stages=3),
     (100, 100): helion.Config(num_warps=8, num_stages=4, l2_groupings=[4]),
     (128, 128): helion.Config(num_warps=8, num_stages=4, l2_groupings=[8]),
@@ -25,7 +30,7 @@ KV_CONFIGS: dict[tuple[int, int], helion.Config] = {
 
 
 def _make_kernel(config: helion.Config):
-    @helion.kernel(dot_precision="ieee", config=config)
+    @helion.kernel(config=config)
     def kernel(
         k: torch.Tensor,
         v: torch.Tensor,
@@ -47,11 +52,11 @@ def _make_kernel(config: helion.Config):
             b_idx = flat_bh.begin // H
             h_idx = flat_bh.begin % H
 
-            a_chunk = A[b_idx, rt, h_idx, :].to(torch.float32)
+            a_chunk = A[b_idx, rt, h_idx, :].to(torch.bfloat16)
             beta_chunk = beta[b_idx, rt, h_idx].to(torch.float32)
             beta_g_chunk = beta_g[b_idx, rt, h_idx].to(torch.float32)
-            rhs_k = k[b_idx, rt, h_idx, :].to(torch.float32) * beta_g_chunk[:, None]
-            rhs_v = v[b_idx, rt, h_idx, :].to(torch.float32) * beta_chunk[:, None]
+            rhs_k = (k[b_idx, rt, h_idx, :].to(torch.float32) * beta_g_chunk[:, None]).to(torch.bfloat16)
+            rhs_v = (v[b_idx, rt, h_idx, :].to(torch.float32) * beta_chunk[:, None]).to(torch.bfloat16)
 
             w_out[b_idx, rt, h_idx, :] = hl.dot(
                 a_chunk,
