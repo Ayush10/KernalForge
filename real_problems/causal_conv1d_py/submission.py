@@ -18,10 +18,7 @@ def _causal_conv1d(
     pid_bd = tl.program_id(1)  # batch*D index
     d = pid_bd % D
 
-    # Load bias
     b_val = tl.load(b_ptr + d)
-
-    # Row pointers (x is [B, D, S] contiguous → pid_bd * S offsets correctly)
     x_row = x_ptr + pid_bd * S
     y_row = y_ptr + pid_bd * S
 
@@ -46,11 +43,11 @@ def _causal_conv1d(
 
 # Per-shape tuned configs: (BLOCK_S, num_warps, num_stages)
 _CONFIGS = {
-    (1, 768, 512, 4):   (256, 2, 1),
-    (1, 768, 2048, 4):  (512, 4, 1),
-    (1, 1536, 2048, 4): (1024, 8, 3),
-    (1, 2560, 2048, 4): (1024, 8, 2),
-    (1, 2560, 4096, 4): (4096, 4, 3),
+    (1, 768, 512, 4):   (256, 2, 2),
+    (1, 768, 2048, 4):  (2048, 16, 4),
+    (1, 1536, 2048, 4): (1024, 8, 2),
+    (1, 2560, 2048, 4): (512, 1, 2),
+    (1, 2560, 4096, 4): (4096, 8, 2),
 }
 
 _DEFAULT = (256, 4, 2)
