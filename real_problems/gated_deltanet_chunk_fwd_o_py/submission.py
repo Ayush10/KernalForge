@@ -1,6 +1,7 @@
 #!POPCORN leaderboard gated_deltanet_chunk_fwd_o
 #!POPCORN gpu B200_Nebius
-# Team: Kernal Forge
+# Team: KernalForge
+# Fix: Group configs by (K,V) to reduce JIT compilations from 10 to 4
 from task import input_t, output_t
 
 import torch
@@ -8,24 +9,16 @@ import helion
 import helion.language as hl
 
 
-SHAPE_CONFIGS: dict[tuple[int, int, int, int, int], helion.Config] = {
-    # Test shapes
-    (1, 64, 2, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
-    (2, 128, 4, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
-    (1, 256, 4, 64, 128): helion.Config(block_sizes=[8], num_warps=4, num_stages=1, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
-    # Benchmark shapes
-    (1, 64, 1, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
-    (2, 512, 3, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
-    (2, 1024, 3, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
-    (3, 1024, 4, 100, 100): helion.Config(block_sizes=[32], num_warps=4, num_stages=1, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
-    (4, 1024, 4, 128, 128): helion.Config(block_sizes=[64], num_warps=4, num_stages=1, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
-    (2, 1536, 4, 128, 128): helion.Config(block_sizes=[64], num_warps=4, num_stages=1, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
-    (4, 2048, 8, 64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2, advanced_controls_file="/opt/booster_pack/chunk_fwd_o_4.acf"),
+KV_CONFIGS: dict[tuple[int, int], helion.Config] = {
+    (64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),
+    (64, 128): helion.Config(block_sizes=[8], num_warps=4, num_stages=1),
+    (100, 100): helion.Config(block_sizes=[32], num_warps=4, num_stages=1),
+    (128, 128): helion.Config(block_sizes=[64], num_warps=4, num_stages=1),
 }
 
 
 def _make_kernel(config: helion.Config):
-    @helion.kernel(static_shapes=True, config=config)
+    @helion.kernel(config=config)
     def kernel(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -80,7 +73,7 @@ def _make_kernel(config: helion.Config):
     return kernel
 
 
-_KERNELS = {shape: _make_kernel(cfg) for shape, cfg in SHAPE_CONFIGS.items()}
+_KERNELS = {kv: _make_kernel(cfg) for kv, cfg in KV_CONFIGS.items()}
 
 
 def custom_kernel(data: input_t) -> output_t:
@@ -88,5 +81,5 @@ def custom_kernel(data: input_t) -> output_t:
     B, T, H, K = q.shape
     V = v_new.shape[-1]
     scale = K ** -0.5
-    kernel = _KERNELS[(B, T, H, K, V)]
+    kernel = _KERNELS[(K, V)]
     return kernel(q, k, v_new, h, g, scale)
