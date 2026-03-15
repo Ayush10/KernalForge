@@ -10,10 +10,10 @@ import helion.language as hl
 
 
 KV_CONFIGS: dict[tuple[int, int], helion.Config] = {
-    (64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=2),
-    (64, 128): helion.Config(block_sizes=[8], num_warps=4, num_stages=1),
-    (100, 100): helion.Config(block_sizes=[32], num_warps=4, num_stages=1),
-    (128, 128): helion.Config(block_sizes=[64], num_warps=4, num_stages=1),
+    (64, 64): helion.Config(block_sizes=[32], num_warps=4, num_stages=3),
+    (64, 128): helion.Config(block_sizes=[32], num_warps=4, num_stages=3),
+    (100, 100): helion.Config(block_sizes=[32], num_warps=4, num_stages=3),
+    (128, 128): helion.Config(block_sizes=[32], num_warps=4, num_stages=3),
 }
 
 
